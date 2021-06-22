@@ -1,0 +1,290 @@
+name: Pull Requests
+
+# When someone comment "/deploy" on anyone PR,
+# this workflow will be triggered and run.
+on:
+  pull_request:
+    types: [ labeled ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
+  CKB_CLI_VERSION: v0.40.0
+  GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+  # CARGO_TARGET_DIR: ${{ github.workspace }}/../target
+  LOGBAK_USER: ${{secrets.LOGBAK_USER}}  #LOCBAK_* for upload logs to server when test failed, for windows
+  LOGBAK_PASSWORD: ${{secrets.LOGBAK_PASSWORD}}
+  LOGBAK_SERVER: ${{secrets.LOGBAK_SERVER}}
+jobs:
+#job for checkout the ckb
+  checkout:
+    name: ckb-checkout
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [Linux-runner, mac-runner,win-runner]
+        include:
+          - os: Linux-runner
+            script_run: make build
+          - os:  mac-runner
+            script_run: make build
+          - os: win-runner
+            script_run: devtools/windows/make prod
+    steps:
+    - name: Set Cargo path
+      run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+    - uses: actions/checkout@v2
+      with:
+        submodules: false
+        fetch-depth: 2
+        ref: ${{ github.event.pull_request.head.sha }}
+        repository: ${{github.event.pull_request.head.repo.full_name}}
+    - run: ${{ matrix.script_run }}
+  UnitTest:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [Linux-runner, mac-runner,win-runner]
+        include:
+          - os: Linux-runner
+            script_run: make test
+          - os:  mac-runner
+            script_run: make test
+          - os: win-runner
+            script_run: devtools/windows/make test
+            CI: true
+            ImageOS: 'windows-2019'
+            BUILD_BUILDID: ${{ github.sha }}
+    needs: checkout
+    steps:
+    - name: Set Cargo path
+      run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+    - name: UnitTest
+      run: ${{ matrix.script_run }}
+    env:
+      CI: ${{ matrix.CI }}
+      SENTRY_DSN: ${{ matrix.SENTRY_DSN }}
+      ImageOS:  ${{ matrix.ImageOS }}
+
+  Benchmarks_Test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+        -  Linux-runner
+        -  mac-runner
+    needs: UnitTest
+    steps:
+    - name: Set Cargo path
+      run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+    - name: Benchmarks_Test
+      run: |
+        make bench-test
+  Integration_Test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [Linux-runner, mac-runner,win-runner]
+        include:
+          - os: Linux-runner
+            script_run: make integration
+          - os:  mac-runner
+            script_run: RUST_BACKTRACE=1 RUST_LOG=${INTEGRATION_RUST_LOG} test/run.sh --release -- --bin $CARGO_TARGET_DIR/release/ckb ${CKB_TEST_ARGS}
+            NTEGRATION_RUST_LOG: info,ckb_test=debug,ckb_sync=debug,ckb_relay=debug,ckb_network=debug
+            CKB_TEST_ARGS: -c 4
+          - os: win-runner
+            script_run: devtools/windows/make CKB_TEST_SEC_COEFFICIENT=5 CKB_TEST_ARGS="-c 4 --no-report" integration
+            CI: true
+            SENTRY_DSN: "https://15373165fbf2439b99ba46684dfbcb12@sentry.nervos.org/7"
+    needs: Benchmarks_Test
+    steps:
+    - name: Set Cargo path
+      run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+    - name: Integration_Test
+      run: ${{ matrix.script_run }}
+    env:
+      INTEGRATION_RUST_LOG: ${{ matrix.INTEGRATION_RUST_LOG }}
+      CKB_TEST_ARGS: ${{ matrix.CKB_TEST_ARGS }}
+      CI: ${{ matrix.CI }}
+      SENTRY_DSN: ${{ matrix.SENTRY_DSN }}
+  
+  Linters:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+        -  Linux-runner
+        -  mac-runner
+    needs: Integration_Test
+    if: ${{github.ref == 'refs/heads/master'}}
+    steps:
+    - name: Set Cargo path
+      run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+    - name: Linters
+      run: |
+         cargo fmt --version || travis_retry rustup component add rustfmt
+         cargo clippy --version || travis_retry rustup component add clippy
+         make fmt
+         make clippy
+         git diff --exit-code Cargo.lock
+  Latest_Linters:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [Linux-runner, mac-runner]
+        include:
+          - os: Linux-runner
+            script_run: rustup component add rustfmt --toolchain stable-x86_64-unknown-linux-gnu &&  rustup component add clippy --toolchain stable-x86_64-unknown-linux-gnu
+          - os:  mac-runner
+            script_run: rustup component add rustfmt-preview && rustup component add clippy-preview
+    needs: Linters
+    continue-on-error: true
+    steps:
+    - name: Set Cargo path
+      run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+    - name: Pre install
+      run: ${{ matrix.script_run }}
+    - name: Latest_Linters
+      run: |
+        mv rust-toolchain rust-toolchain.bak
+        echo "stable" > rust-toolchain
+        make fmt
+        make clippy
+        mv rust-toolchain.bak rust-toolchain
+  Quick_Check:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+        -  Linux-runner
+        -  mac-runner
+    needs: Latest_Linters
+    continue-on-error: true
+    steps:
+    - name: Set Cargo path
+      run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+    - name: Quick_Check
+      run: |
+        make check-cargotoml
+        make check-whitespaces
+        make check-dirty-rpc-doc
+        make check-dirty-hashes-toml
+        devtools/ci/check-cyclic-dependencies.py
+  Cyclic_dev_dependencies:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+        -  Linux-runner
+        -  mac-runner
+    needs: Quick_Check
+    continue-on-error: true
+    steps:
+    - name: Set Cargo path
+      run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+    - name: Cyclic_dev_dependencies
+      run: |
+        devtools/ci/check-cyclic-dependencies.py --dev
+  Security_Audit_Licenses:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+        -  Linux-runner
+        -  mac-runner
+    needs: Cyclic_dev_dependencies
+    continue-on-error: true
+    steps:
+    - name: Set Cargo path
+      run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+    - name: Security Audit & Licenses
+      run: |
+        cargo deny --version || travis_retry cargo install cargo-deny --locked
+        make security-audit
+        make check-crates
+        make check-licenses
+  WASM_build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+        -  Linux-runner
+        -  mac-runner
+    needs: Security_Audit_Licenses
+    steps:
+    - name: Set Cargo path
+      run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+    - name: WASM build
+      run: |
+        export PATH=/usr/lib/llvm-8/bin:$PATH
+        rustup target add wasm32-unknown-unknown
+        make wasm-build-test
+
+  Code_Coverage:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+        -  Linux-runner
+        # -  mac-runner only support for linux
+    needs: WASM_build
+    steps:
+    - name: Set Cargo path
+      run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+    - name: Code Coverage
+      run: |
+        cargo tarpaulin --version || travis_retry cargo install cargo-tarpaulin --locked
+        if make cov; then bash <(curl -s https://codecov.io/bash); fi
+      env:
+        CACHE_NAME: tarpaulin
+
+  # Integration_Test:
+  #   runs-on: ${{ matrix.os }}
+  #   strategy:
+  #     matrix:
+  #       os: [Linux-runner, mac-runner,win-runner]
+  #       include:
+  #         - os: Linux-runner
+  #           script_run: cp -f Cargo.lock test/Cargo.lock && rm -rf test/target && ln -snf $CARGO_TARGET_DIR} test/target && RUST_BACKTRACE=1 RUST_LOG=${INTEGRATION_RUST_LOG} test/run.sh --release -- --bin $CARGO_TARGET_DIR}/debug/ckb ${CKB_TEST_ARGS}
+  #           INTEGRATION_RUST_LOG: info,ckb_test=debug,ckb_sync=debug,ckb_relay=debug,ckb_network=debug
+  #           CKB_TEST_ARGS: -c 4
+  #         - os:  mac-runner
+  #           script_run: RUST_BACKTRACE=1 RUST_LOG=${INTEGRATION_RUST_LOG} test/run.sh --release -- --bin $CARGO_TARGET_DIR}/debug/ckb ${CKB_TEST_ARGS}
+  #           INTEGRATION_RUST_LOG: info,ckb_test=debug,ckb_sync=debug,ckb_relay=debug,ckb_network=debug
+  #           CKB_TEST_ARGS: -c 4
+  #         - os: win-runner
+  #           script_run: devtools/windows/make CKB_TEST_SEC_COEFFICIENT=5 CKB_TEST_ARGS="-c 4 --no-report" integration
+  #           CI: true
+  #           SENTRY_DSN: 'https://15373165fbf2439b99ba46684dfbcb12@sentry.nervos.org/7'
+  #   needs: checkout
+  #   steps:
+  #   - name: Set Cargo path
+  #     run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+  #   - name: Integration_Test
+  #     run: ${{ matrix.script_run }}
+  #   env:
+  #     INTEGRATION_RUST_LOG: ${{ matrix.INTEGRATION_RUST_LOG }}
+  #     CKB_TEST_ARGS: ${{ matrix.CKB_TEST_ARGS }}
+  #     CI: ${{ matrix.CI }}
+  #     SENTRY_DSN: ${{ matrix.SENTRY_DSN }}
+
+
+  # Code_Coverage:
+  #   runs-on: ${{ matrix.os }}
+  #   strategy:
+  #     matrix:
+  #       os:
+  #       -  Linux-runner
+  #       # -  mac-runner only support for linux
+  #   needs: Integration_Test
+  #   steps:
+  #   - name: Set env
+  #     run: echo "CARGO_TARGET_DIR=$(echo $HOME/target)" >> $GITHUB_ENV
+  #   - name: Set Cargo path
+  #     run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+  #   - name: Code Coverage
+  #     run: |
+  #       cargo tarpaulin --version || travis_retry cargo install cargo-tarpaulin --locked
+  #       if make cov; then bash <(curl -s https://codecov.io/bash); fi
+  #     env:
+  #       CACHE_NAME: tarpaulin

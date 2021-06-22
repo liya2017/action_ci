@@ -1,0 +1,102 @@
+name: Pull Requests
+
+# When someone comment "/deploy" on anyone PR,
+# this workflow will be triggered and run.
+on:
+  pull_request:
+    types: [ opened, synchronize, reopened, labeled ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
+  CKB_CLI_VERSION: v0.40.0    
+jobs:
+#job for checkout the ckb
+  checkout: 
+    name: ckb-checkout  
+    runs-on: [self-hosted, linux, X64]
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        submodules: false
+        fetch-depth: 2
+        ref: ${{ github.event.pull_request.head.sha }}
+        repository: ${{github.event.pull_request.head.repo.full_name}}
+  Test: 
+    runs-on: [self-hosted, linux, X64]
+    needs: checkout
+    steps:
+    - name: Test
+      run: |
+        cat ${{ github.workspace }}/README.md
+        make test
+        rm -rf $HOME/.cargo/registry
+  Linters: 
+    runs-on: [self-hosted, linux, X64]
+    needs: Test
+    steps:
+    - name: Linters
+      run: |
+         cargo fmt --version || travis_retry rustup component add rustfmt
+         cargo clippy --version || travis_retry rustup component add clippy
+         make fmt
+         make clippy
+         git diff --exit-code Cargo.lock
+  Latest_Linters:
+    runs-on: [self-hosted, linux, X64]
+    needs: Linters 
+    continue-on-error: true
+    steps:
+    - name: Latest_Linters
+      run: |
+        rustup component add rustfmt --toolchain stable-x86_64-unknown-linux-gnu
+        rustup component add clippy --toolchain stable-x86_64-unknown-linux-gnu
+        mv rust-toolchain rust-toolchain.bak
+        echo "stable" > rust-toolchain
+        make fmt
+        make clippy
+        mv rust-toolchain.bak rust-toolchain
+  Quick_Check:
+    runs-on: [self-hosted, linux, X64]
+    needs: Latest_Linters
+    steps:  
+    - name: Quick_Check
+      run: |
+        make check-cargotoml
+        make check-whitespaces
+        make check-dirty-rpc-doc
+        make check-dirty-hashes-toml
+        devtools/ci/check-cyclic-dependencies.py 
+  Cyclic_dev_dependencies:
+    runs-on: [self-hosted, linux, X64]
+    needs: Quick_Check  
+    continue-on-error: true
+    steps:
+    - name: Cyclic_dev_dependencies
+      run: |
+        devtools/ci/check-cyclic-dependencies.py --dev
+  Security_Audit_Licenses:
+    runs-on: [self-hosted, linux, X64]
+    needs: Cyclic_dev_dependencies
+    continue-on-error: true
+    steps:  
+    - name: Security Audit & Licenses
+      run: |
+        cargo deny --version || travis_retry cargo install cargo-deny --locked
+        make security-audit
+        make check-crates
+        make check-licenses
+  WASM_build:
+    runs-on: [self-hosted, linux, X64]
+    needs: Security_Audit_Licenses
+    steps: 
+    - name: WASM build
+      run: |
+        export PATH=/usr/lib/llvm-8/bin:$PATH
+        rustup target add wasm32-unknown-unknown
+        make wasm-build-test
+
+
+ 
+
+
